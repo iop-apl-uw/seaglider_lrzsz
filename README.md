@@ -5,5 +5,5 @@ handling Seaglider xmodem traffic
 
 ## Building
 
-build.sh to install 
+build.sh to build\
 sudo make install to install 
