@@ -75,11 +75,12 @@ lsyslog(prio,format,va_alist)
     /* syslog(prio,"[%s] %s",username,s); */
     {
 		FILE *logfp;
-		char *buffer;
+		//char *buffer;
 
-		buffer = alloca(PATH_MAX+1);
-		sprintf(buffer, "%s/comm.log", getenv("HOME"));
-		if ((logfp = fopen(buffer,"a")) != NULL) {
+		//buffer = alloca(PATH_MAX+1);
+		//sprintf(buffer, "%s/comm.log", getenv("HOME"));
+		//if ((logfp = fopen(buffer,"a")) != NULL) {
+        if ((logfp = fopen("comm.log", "a")) != NULL) {
 			char *timebuf = alloca(26); /* at least 26 chars */
 			time_t t;
 			time(&t); // now
