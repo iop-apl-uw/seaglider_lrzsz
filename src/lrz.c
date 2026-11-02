@@ -80,6 +80,9 @@ int Readnum = HOWMANY;	/* Number of bytes to ask for in read() from modem */
 int skip_if_not_found;
 
 char *Pathname;
+/* Seaglider: TRUE while fout holds a file being received (not yet closeit()), so the
+ * error and signal paths only save a partial file that is actually open */
+static int receiving=FALSE;
 const char *program_name;		/* the name by which we were called */
 
 int Topipe=0;
@@ -121,6 +124,7 @@ char tcp_buf[256]="";
 static int o_sync = 0;
 #endif
 static int rzfiles __P ((struct zm_fileinfo *));
+static void save_partial __P ((void));
 static int tryz __P ((void));
 static void checkpath __P ((const char *name));
 static void chkinvok __P ((const char *s));
@@ -194,6 +198,10 @@ int enable_syslog=FALSE;
 RETSIGTYPE
 bibi(int n)
 {
+	/* Seaglider: a hangup mid-transfer used to kill lrz with the partial file left
+	 * under its fragment name, mode 0600 - unreadable by basestation processing */
+	if (Restricted)
+		save_partial();
 	if (zmodem_requested)
 		zmputs(Attn);
 	canit(STDOUT_FILENO);
@@ -558,6 +566,7 @@ main(int argc, char *argv[])
 		signal(SIGINT, bibi);
 	signal(SIGTERM, bibi);
 	signal(SIGPIPE, bibi);
+	signal(SIGHUP, bibi);
 	if (wcreceive(npats, patts)==ERROR) {
 		exitcode=0200;
 		canit(STDOUT_FILENO);
@@ -803,6 +812,7 @@ wcreceive(int argc, char **argp)
 #endif
 			return ERROR;
 		}
+		receiving=TRUE;
 		if (wcrx(&zi)==ERROR) {
 			goto fubar;
 		}
@@ -840,39 +850,47 @@ fubar:
 	if (Topipe && fout) {
 		pclose(fout);  return ERROR;
 	}
-	if (fout)
-		fclose(fout);
-
-	if (Restricted && Pathname) {
+	if (Restricted) {
 		// Don't delete partial data files, save as much as you got
-#ifdef DEAD
-		unlink(Pathname);
-		vstringf(_("\r\n%s: %s removed.\r\n"), program_name, Pathname);
-#else
-		char *system_cmd=malloc(2*PATH_MAX);
-        char *datetime=malloc(2*PATH_MAX);
-        struct tm tm;
-        time_t    secs;
-		int       result;
-
-        secs = time(NULL);
-        gmtime_r(&secs, &tm);
-        strftime(datetime, 2*PATH_MAX - 1, "%Y%m%d%H%M%S", &tm);
-        snprintf(system_cmd, 2*PATH_MAX - 1, "%s.%s", Pathname, datetime);
-        result = rename(Pathname, system_cmd);
-		DO_SYSLOG((LOG_INFO, "processed partial file %s->%s (0x%x)",Pathname, system_cmd, result));
-        
-		//if (!system_cmd) error(1,0,_("out of memory"));
-		//sprintf(system_cmd,"/usr/bin/perl /usr/local/basestation/lrz_drop.pl %s",Pathname);
-		//result=system(system_cmd); // Process it
-		//DO_SYSLOG((LOG_INFO, "processed partial file %s (0x%x)",Pathname,result));
-		//free(system_cmd);
-        //free(datetime);
-#endif // DEAD
+		save_partial();
+	} else if (fout) {
+		fclose(fout);
+		fout=NULL;
+		receiving=FALSE;
 	}
 	return ERROR;
 }
 
+/*
+ * Seaglider: save the file being received as <name>.<UTC YYYYmmddHHMMSS> and make it
+ * readable (0644) - umask(0077) has it at 0600 while it's received, and basestation
+ * processing runs as a different account.  Called from the error path and from bibi(),
+ * so a protocol error and a hangup leave the same thing behind.
+ */
+static void
+save_partial(void)
+{
+	char partial_name[2*PATH_MAX];
+	char datetime[32];
+	struct tm tm;
+	time_t secs;
+	int result;
+
+	if (!receiving || !Pathname)
+		return;
+	receiving=FALSE;	/* first - bibi() may get here again */
+	if (fout) {
+		fclose(fout);
+		fout=NULL;
+	}
+	secs = time(NULL);
+	gmtime_r(&secs, &tm);
+	strftime(datetime, sizeof(datetime), "%Y%m%d%H%M%S", &tm);
+	snprintf(partial_name, sizeof(partial_name), "%s.%s", Pathname, datetime);
+	chmod(Pathname, 00644);
+	result = rename(Pathname, partial_name);
+	DO_SYSLOG((LOG_INFO, "processed partial file %s->%s (0x%x)", Pathname, partial_name, result));
+}
 
 /*
  * Fetch a pathname from the other end as a C ctyle ASCIZ string.
@@ -1295,19 +1313,23 @@ procheader(char *name, struct zm_fileinfo *zi)
 				}
 			}
 			fclose(fout);
+			fout=NULL;
 		} else if (zmanag==ZF1_ZMCRC) {
 			int r=do_crc_check(fout,zi->bytes_total,0);
 			if (r==ERROR) {
 				fclose(fout);
+				fout=NULL;
 				return ERROR;
 			}
 			if (r!=ZCRC_DIFFERS) {
 				return ERROR; /* skips */
 			}
 			fclose(fout);
+			fout=NULL;
 		} else {
 			size_t namelen;
 			fclose(fout);
+			fout=NULL;
 			if ((zmanag & ZF1_ZMMASK)!=ZF1_ZMCHNG) {
 				if (Verbose)
 					vstringf(_("file exists, skipped: %s\n"),name);
@@ -1440,6 +1462,7 @@ procheader(char *name, struct zm_fileinfo *zi)
 					int r=do_crc_check(fout,zi->bytes_total,st.st_size);
 					if (r==ERROR) {
 						fclose(fout);
+						fout=NULL;
 						return ZFERR;
 					}
 					if (r==ZCRC_DIFFERS) {
@@ -1454,6 +1477,7 @@ procheader(char *name, struct zm_fileinfo *zi)
 				if (can_resume) {
 					if (fseek(fout, (long) zi->bytes_skipped, SEEK_SET)) {
 						fclose(fout);
+						fout=NULL;
 						return ZFERR;
 					}
 				}
@@ -1462,8 +1486,10 @@ procheader(char *name, struct zm_fileinfo *zi)
 				goto buffer_it;
 			}
 			zi->bytes_skipped=0;
-			if (fout)
+			if (fout) {
 				fclose(fout);
+				fout=NULL;
+			}
 		}
 		fout = fopen(name_static, openmode);
 #ifdef ENABLE_MKDIR
@@ -1487,6 +1513,7 @@ buffer_it:
 	if (Topipe == 0) {
 		static char *s=NULL;
 		static size_t last_length=0;
+		receiving=TRUE;
 #if defined(F_GETFD) && defined(F_SETFD) && defined(O_SYNC)
 		if (o_sync) {
 			int oldflags;
@@ -2319,9 +2346,13 @@ closeit(struct zm_fileinfo *zi)
 			error(1,errno,_("fgets for tcp protocol synchronization failed: "));
 		}	
 		fclose(fout);
+		fout=NULL;
+		receiving=FALSE;
 		return OK;
 	}
 	ret=fclose(fout);
+	fout=NULL;
+	receiving=FALSE;
 	if (ret) {
 		zpfatal(_("file close error"));
 		/* this may be any sort of error, including random data corruption */
